@@ -24,6 +24,9 @@
         <Project Path="experimental/REDox.Images/REDox.Images.csproj" />
         <Project Path="experimental/REDox.Yaml/REDox.Yaml.csproj" />
     </Folder>
+    <Folder Name="/tools/">
+        <Project Path="tools/REDox.Unreal/REDox.Unreal.csproj" />
+    </Folder>
     <Project Path="src/REDox.Cbor/REDox.Cbor.csproj" />
     <Project Path="src/REDox.Csv/REDox.Csv.csproj" />
     <Project Path="src/REDox.Dynamic/REDox.Dynamic.csproj" />

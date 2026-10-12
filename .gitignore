@@ -14,3 +14,4 @@ tests/REDox.Tests.sln.DotSettings.user
 /benchmarks/REDox.Benchmarks/BenchmarkDotNet.Artifacts
 REDox.sln.DotSettings.user
 BenchmarkDotNet.Artifacts/
+/tools/REDox.Unreal/redox-unreal.json

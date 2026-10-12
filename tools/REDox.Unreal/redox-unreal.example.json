@@ -1,0 +1,6 @@
+{
+    "DefaultEngine": "MySourceBuild",
+    "Engines": {
+        "MySourceBuild": "D:\\UnrealEngine"
+    }
+}
