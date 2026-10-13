@@ -260,16 +260,6 @@ static class Utf8Helper
     }
 
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void WriteString(DocumentWriter writer, ReadOnlySpan<char> chars)
-    {
-        var buf = writer.BeginWrite(chars.Length * 4);
-
-        var count = Encoding.UTF8.GetBytes(chars, buf);
-
-        writer.EndWrite(count);
-    }
-
     private static void FormatDecimalPart(Span<byte> buf, ref int bytes)
     {
         for (var i = 0; i < bytes; i++)
@@ -1568,6 +1558,39 @@ static class Utf8Helper
         }
 
         return a.SequenceEqual(b);
+    }
+
+    /// <summary>
+    ///     Computes a hash code that is consistent with
+    ///     <see cref="Equals(ReadOnlySpan{byte}, ReadOnlySpan{byte}, bool)" />.
+    /// </summary>
+    public static int GetHashCode(ReadOnlySpan<byte> bytes, bool ignoreCase)
+    {
+        var hashCode = new HashCode();
+
+        if (!ignoreCase)
+        {
+            hashCode.AddBytes(bytes);
+            return hashCode.ToHashCode();
+        }
+
+        var words = MemoryMarshal.Cast<byte, long>(bytes);
+
+        for (var i = 0; i < words.Length; i++)
+        {
+            hashCode.Add(ToUpper(words[i]));
+        }
+
+        long tail = 0;
+
+        for (var i = bytes.Length - 1; i >= words.Length * 8; i--)
+        {
+            tail = (tail << 8) | bytes[i];
+        }
+
+        hashCode.Add(ToUpper(tail));
+
+        return hashCode.ToHashCode();
     }
 
     public static DTokenVariant GetIntegerTokenKind(ReadOnlySpan<byte> number)

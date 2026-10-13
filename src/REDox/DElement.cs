@@ -878,10 +878,10 @@ public readonly partial struct DElement : IEquatable<DElement>
     }
 
     /// <summary>
-    /// Gets the array element at the specified index.
+    ///     Gets the array element at the specified index.
     /// </summary>
     /// <remarks>
-    /// For parsed arrays this is an O(n) operation. Use <see cref="EnumerateArray"/> to iterate all elements.
+    ///     For parsed arrays this is an O(n) operation. Use <see cref="EnumerateArray" /> to iterate all elements.
     /// </remarks>
     public DElement this[int index]
     {
@@ -954,7 +954,16 @@ public readonly partial struct DElement : IEquatable<DElement>
     {
         ThrowIfInvalid();
 
-        return DoxNodeDocument.CreateFrom(this, Document.Settings).RootElement;
+        if (!Token.IsContainer)
+        {
+            var document = new DoxNodeDocument(Document.Settings);
+            document.RootId = document.JoinElement(0, this);
+            return document.RootElement;
+        }
+
+        var clone = new DoxNodeDocument(Document.Settings);
+        clone.RootId = clone.CloneElementToTokens(this);
+        return clone.RootElement;
     }
 
     public override bool Equals(object? obj)
