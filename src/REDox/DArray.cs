@@ -169,7 +169,7 @@ public sealed partial class DArray : DContainer, IList<DValue>
                 throw new ArgumentOutOfRangeException(nameof(index));
             }
 
-            return new DValue(this, _values[index], index);
+            return new DValue(this, index);
         }
         set
         {
@@ -242,6 +242,7 @@ public sealed partial class DArray : DContainer, IList<DValue>
         }
 
         _count = 0;
+        IncrementVersion();
     }
 
     public void RemoveAt(int index)
@@ -257,12 +258,43 @@ public sealed partial class DArray : DContainer, IList<DValue>
         _values.AsSpan().Slice(index + 1, _count - index - 1)
             .CopyTo(_values.AsSpan().Slice(index, _count - index - 1));
         _count--;
+        IncrementVersion();
     }
 
     IEnumerator IEnumerable.GetEnumerator()
     {
         ThrowIfInvalid();
         return GetEnumerator();
+    }
+
+    /// <summary>Exchanges two elements without copying or replacing their values.</summary>
+    /// <remarks>
+    ///     Trivia remains attached to its existing tokens. Swapping an element with itself has no effect.
+    ///     Position-bound values for moved elements become invalid; token-based references remain valid.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Either index is outside the array.</exception>
+    /// <exception cref="ObjectDisposedException">The array is no longer valid.</exception>
+    public void Swap(int index1, int index2)
+    {
+        ThrowIfInvalid();
+
+        if ((uint)index1 >= _count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index1));
+        }
+
+        if ((uint)index2 >= _count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index2));
+        }
+
+        if (index1 == index2)
+        {
+            return;
+        }
+
+        (_values[index1], _values[index2]) = (_values[index2], _values[index1]);
+        IncrementVersion();
     }
 
     protected internal override DValue GetValue(int index)
@@ -275,14 +307,14 @@ public sealed partial class DArray : DContainer, IList<DValue>
         Document.JoinValue(_values[index], value);
     }
 
-    protected internal override DElement GetKeyElement(int index)
+    protected internal override uint GetKeyId(int index)
     {
         throw new NotSupportedException();
     }
 
-    protected internal override DElement GetValueElement(int index)
+    protected internal override uint GetValueId(int index)
     {
-        return new DElement(Document, _values[index]);
+        return _values[index];
     }
 
     public void RemoveRange(int index, int count)
@@ -315,6 +347,7 @@ public sealed partial class DArray : DContainer, IList<DValue>
         _values.AsSpan().Slice(index + count, _count - index - count)
             .CopyTo(_values.AsSpan().Slice(index, _count - index - count));
         _count -= count;
+        IncrementVersion();
     }
 
     public Enumerator GetEnumerator()
@@ -411,6 +444,7 @@ public sealed partial class DArray : DContainer, IList<DValue>
         _values.AsSpan().Slice(index, _count - index).CopyTo(_values.AsSpan(index + 1, _count - index));
         _values[index] = tokenId;
         _count++;
+        IncrementVersion();
     }
 
     internal uint GetValueInternal(int index)

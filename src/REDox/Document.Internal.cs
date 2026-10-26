@@ -820,6 +820,16 @@ public abstract partial class Document
             }
         }
 
+        if (value.Instance is Document document)
+        {
+            return JoinElement(tokenId, new DElement(document, (uint)value.Payload));
+        }
+
+        if (value.Instance is DContainer container)
+        {
+            return JoinElement(tokenId, new DElement(container.Document, value.GetContainerValueId(container)));
+        }
+
         if (value.Payload == 0)
         {
             if (value.Instance == null)
@@ -828,16 +838,6 @@ public abstract partial class Document
             }
 
             return SerializeToTokens(tokenId, value.Instance, value.Instance.GetType(), Settings);
-        }
-
-        if (value.Instance is Document document)
-        {
-            return JoinElement(tokenId, new DElement(document, (uint)value.Payload));
-        }
-
-        if (value.Instance is DContainer container)
-        {
-            return JoinElement(tokenId, new DElement(container.Document, (uint)value.Payload));
         }
 
         return ExtendToken(tokenId, new DToken(value.Payload).Variant, value.Instance);
@@ -2486,7 +2486,6 @@ public abstract partial class Document
             $"Cannot convert value {new DElement(this, tokenId)} to {typeof(DateTimeOffset)}");
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetDecimalExact(uint tokenId, out decimal value)
     {
         var token = GetToken(tokenId);
@@ -2554,7 +2553,6 @@ public abstract partial class Document
     }
 
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal decimal GetDecimalValue(uint tokenId)
     {
         if (TryGetDecimalExact(tokenId, out var value))

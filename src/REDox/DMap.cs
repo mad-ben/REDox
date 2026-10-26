@@ -116,7 +116,7 @@ public sealed partial class DMap : DContainer, IList<KeyValuePair<DValue, DValue
         for (var i = 0; i < _count; i++)
         {
             yield return new KeyValuePair<DValue, DValue>(new DValue(Document, _values[i].Key),
-                new DValue(this, _values[i].Value, i));
+                new DValue(this, i));
         }
     }
 
@@ -149,7 +149,7 @@ public sealed partial class DMap : DContainer, IList<KeyValuePair<DValue, DValue
         for (var i = 0; i < _count; i++)
         {
             keyValuePair[index + i] = new KeyValuePair<DValue, DValue>(new DValue(doc, _values[i].Key),
-                new DValue(this, _values[i].Value, i));
+                new DValue(this, i));
         }
     }
 
@@ -185,6 +185,7 @@ public sealed partial class DMap : DContainer, IList<KeyValuePair<DValue, DValue
 
         _values.AsSpan(0, _count).Clear();
         _count = 0;
+        IncrementVersion();
     }
 
     IEnumerator IEnumerable.GetEnumerator()
@@ -243,16 +244,47 @@ public sealed partial class DMap : DContainer, IList<KeyValuePair<DValue, DValue
         _values.AsSpan().Slice(index + 1, _count - index - 1)
             .CopyTo(_values.AsSpan().Slice(index, _count - index - 1));
         _values[--_count] = default;
+        IncrementVersion();
     }
 
-    protected internal override DElement GetKeyElement(int index)
+    /// <summary>Exchanges two entries
+    /// <remarks>
+    ///     Trivia remains attached to its existing tokens. Swapping an entry with itself has no effect.
+    ///     Position-bound values for moved entries become invalid; token-based references remain valid.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Either index is outside the map.</exception>
+    /// <exception cref="ObjectDisposedException">The map is no longer valid.</exception>
+    public void Swap(int index1, int index2)
     {
-        return new DElement(Document, _values[index].Key);
+        ThrowIfInvalid();
+
+        if ((uint)index1 >= _count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index1));
+        }
+
+        if ((uint)index2 >= _count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index2));
+        }
+
+        if (index1 == index2)
+        {
+            return;
+        }
+
+        (_values[index1], _values[index2]) = (_values[index2], _values[index1]);
+        IncrementVersion();
     }
 
-    protected internal override DElement GetValueElement(int index)
+    protected internal override uint GetKeyId(int index)
     {
-        return new DElement(Document, _values[index].Value);
+        return _values[index].Key;
+    }
+
+    protected internal override uint GetValueId(int index)
+    {
+        return _values[index].Value;
     }
 
     public DMap DeepClone()
@@ -382,6 +414,7 @@ public sealed partial class DMap : DContainer, IList<KeyValuePair<DValue, DValue
             .CopyTo(_values.AsSpan(index + 1, _count - index));
         _values[index] = new KeyValuePair<uint, uint>(keyId, valueId);
         _count++;
+        IncrementVersion();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

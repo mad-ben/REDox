@@ -144,6 +144,7 @@ public class DomExtendTest
 
         var obj2 = JsonSerializer.Deserialize<DObject>(json);
 
+        Assert.NotNull(obj2);
         Assert.Equal(obj.ToJsonString(), obj2.ToJsonString());
 
         var map = new DMap();
@@ -154,6 +155,7 @@ public class DomExtendTest
 
         var map2 = JsonSerializer.Deserialize<DMap>(json2);
 
+        Assert.NotNull(map2);
         Assert.Equal(map.ToJsonString(), map2.ToJsonString());
 
         var arr = new DArray(1, "A", true);
@@ -162,6 +164,7 @@ public class DomExtendTest
 
         var arr2 = JsonSerializer.Deserialize<DArray>(json3);
 
+        Assert.NotNull(arr2);
         Assert.Equal(arr.ToJsonString(), arr2.ToJsonString());
 
         var v = DValue.Create(123);
@@ -239,6 +242,20 @@ public class DomExtendTest
         arr2.Add(true);
         Assert.Equal("[1,2,3]", arr.ToJsonString());
         Assert.Equal("[1,2,3,true]", arr2.ToJsonString());
+    }
+
+    [Fact]
+    public void JoinFirstElementOfUnmodifiedContainerTest()
+    {
+        var arr = new DArray(1, 2, 3);
+        var target = new DArray();
+        target.Add(arr[0]);
+        Assert.Equal("[1]", target.ToJsonString());
+
+        var obj = new DObject { { "A", 10 }, { "B", 20 } };
+        var target2 = new DObject();
+        target2.Add("X", obj["A"]);
+        Assert.Equal("""{"X":10}""", target2.ToJsonString());
     }
 
     [Fact]
@@ -608,7 +625,7 @@ public class DomExtendTest
 
             arr.RemoveAt(1);
 
-            Assert.True(element0.IsValid);
+            Assert.False(element0.IsValid);
             Assert.False(element1.IsValid);
             Assert.False(element2.IsValid);
 

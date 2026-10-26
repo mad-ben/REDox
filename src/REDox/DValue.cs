@@ -5,6 +5,7 @@ using System;
 using System.Buffers.Text;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -54,10 +55,16 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
     internal long Payload { get; init; }
 
-    internal DValue(DContainer value, uint id, int index)
+    internal DValue(DContainer value, int index)
     {
         Instance = value;
-        Payload = id | ((long)index << 32);
+        Payload = (uint)value.Version | ((long)index << 32);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal uint GetContainerValueId(DContainer container)
+    {
+        return container.GetValueId((int)(Payload >> 32));
     }
 
     internal DValue(Document doc, uint id)
@@ -479,7 +486,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            return new DElement(container.Document, (uint)Payload);
+            return new DElement(container.Document, GetContainerValueId(container));
         }
 
         return DoxNodeDocument.Create(this).RootElement;
@@ -511,10 +518,8 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
     public string GetPath()
     {
-        ThrowIfInvalid();
-
-        var ss = new StringBuilder();
         var (doc, id) = GetElementInfo();
+        var ss = new StringBuilder();
 
         if (doc == null)
         {
@@ -570,9 +575,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
     {
         get
         {
-            ThrowIfInvalid();
-
-            var (doc, id) = GetElementInfo();
+            var (doc, _) = GetElementInfo();
 
             if (doc == null)
             {
@@ -587,8 +590,6 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
     {
         get
         {
-            ThrowIfInvalid();
-
             var (doc, id) = GetElementInfo();
 
             if (doc == null)
@@ -617,16 +618,9 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get
         {
-            if (Instance is DTokenVariant)
-            {
-                return true;
-            }
-
             if (Instance is DContainer container)
             {
-                var index = (int)(Payload >> 32);
-
-                return container.ValidateValue(index, (uint)Payload);
+                return container.ValidateValue((int)Payload);
             }
 
             if (Instance is Document doc)
@@ -636,6 +630,11 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
                 // Root values continue to reference the current root after descendant edits.
                 return id != 0 && doc.IsValid &&
                        (doc.Version == (int)(Payload >> 32) || id == doc.RootId);
+            }
+
+            if (Instance is DTokenVariant)
+            {
+                return true;
             }
 
             if (Instance == null && Payload == 0)
@@ -650,31 +649,42 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private (Document?, uint) GetElementInfo()
     {
+        if (Instance is DContainer container)
+        {
+            if (!container.ValidateValue((int)Payload))
+            {
+                ThrowInvalid();
+            }
+
+            return (container.Document, GetContainerValueId(container));
+        }
+
         if (Instance is Document doc)
         {
             var id = (uint)Payload;
+
             if (id == 0 || !doc.IsValid ||
                 (doc.Version != (int)(Payload >> 32) && id != doc.RootId))
             {
-                throw new ObjectDisposedException(nameof(DValue));
+                ThrowInvalid();
             }
 
             return (doc, id);
         }
 
-        if (Instance is DContainer container)
+        if (Instance == null && Payload == 0)
         {
-            var id = (uint)Payload;
-            if (!container.ValidateValue((int)(Payload >> 32), id))
-            {
-                throw new ObjectDisposedException(nameof(DValue));
-            }
-
-            return (container.Document, id);
+            ThrowInvalid();
         }
 
-        ThrowIfInvalid();
         return default;
+    }
+
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowInvalid()
+    {
+        throw new ObjectDisposedException(nameof(DValue));
     }
 
     public DValue this[int index]
@@ -888,7 +898,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
     {
         if (Instance is DContainer container)
         {
-            return container.Document.GetToken((uint)Payload);
+            return container.Document.GetToken(GetContainerValueId(container));
         }
 
         if (Instance is Document doc)
@@ -921,7 +931,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            return container.Document.GetElementContainer((uint)Payload);
+            return container.Document.GetElementContainer(GetContainerValueId(container));
         }
 
         if (Instance is Document doc)
@@ -938,7 +948,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            return container.Document.GetElementObject((uint)Payload);
+            return container.Document.GetElementObject(GetContainerValueId(container));
         }
 
         if (Instance is Document doc)
@@ -955,7 +965,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            return container.Document.GetElementMap((uint)Payload);
+            return container.Document.GetElementMap(GetContainerValueId(container));
         }
 
         if (Instance is Document doc)
@@ -972,7 +982,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            return container.Document.GetElementArray((uint)Payload);
+            return container.Document.GetElementArray(GetContainerValueId(container));
         }
 
         if (Instance is Document doc)
@@ -1863,7 +1873,7 @@ public readonly partial struct DValue : IDoxNode, IEquatable<DValue>
 
         if (Instance is DContainer container)
         {
-            var tokenId = (uint)Payload;
+            var tokenId = GetContainerValueId(container);
             var document = container.Document;
             document.JoinAny(tokenId, value);
             return new DValue(document, tokenId);
