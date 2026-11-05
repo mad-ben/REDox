@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Collections.Generic;
@@ -56,7 +56,7 @@ public static class CaptureReader
         Func<DiagnosticEvent, bool>? expandScopes = null)
     {
         var context = new CaptureContext();
-        await using var stream = File.OpenRead(input);
+        await using var stream = DiagnosticFiles.OpenRead(input);
         await foreach (var record in JsonSequence.DeserializeAsync<DiagnosticEvent>(stream, options: Options,
                            cancellationToken: cancellationToken).ConfigureAwait(false))
         {

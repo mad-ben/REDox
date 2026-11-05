@@ -211,7 +211,7 @@ public sealed class DiagnosticReport
         RecordsByKind.TryGetValue(item.Kind, out var kindCount);
         RecordsByKind[item.Kind] = kindCount + 1;
         // Dictionary and summary records are rendered by summarize, not by window reports.
-        if (item.Kind is "TimerDef" or "FrameStats" or "TimerStat" or "GpuQueueStat" or "Hitch" or "FrameTree" or "PsoStat" or "PsoEvent" or "LongScope")
+        if (item.Kind is "TimerDef" or "FrameStats" or "TimerStat" or "GpuQueueStat" or "Hitch" or "FrameTree" or "PsoStat" or "PsoEvent" or "LongScope" or "GpuSpike" or "GpuOverlap")
         {
             return;
         }

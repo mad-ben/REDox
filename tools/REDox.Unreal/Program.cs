@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 using System;
 using System.Collections.Generic;
@@ -16,6 +16,7 @@ internal static class Program
     private const string Help = """
         REDox.Unreal - Unreal diagnostic data
 
+        compress <file> [--out <file.gz>]
         engines [--config <redox-unreal.json>] [--engine <name>]
         receive-live (--out <capture.ndjson> | --output-dir <folder>) [--summary]
         summarize <capture.ndjson | log.ndjson> [--out <summary.md>]
@@ -26,9 +27,11 @@ internal static class Program
                [--thread <id-or-name>] [--limit <1-10000>] [--out <report.json>]
 
         Offline output defaults to stdout; receive-live requires an output file or folder.
-        receive-live --summary also writes <capture>.summary.md; summarize renders it from a finished capture,
+        receive-live --summary embeds Markdown inside the capture; summarize prints it from a finished capture,
         or groups the warnings and errors of an ingest-log output.
-        Output files must not already exist.
+        Inputs ending in .gz are decompressed automatically; --out ending in .gz compresses output.
+        Directory-based live captures default to .ndjson.gz; explicit .ndjson keeps plain output.
+        compress preserves the original file. Output files must not already exist.
         Insights input requires StartTime/EndTime in seconds and thread/timer identifiers or names.
         Text logs retain their original clock and are not aligned to trace time.
         engines lists detected/custom installations as JSON; --engine selects one by name.
@@ -36,6 +39,7 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        Console.OutputEncoding = new UTF8Encoding(false);
         if (args.Length == 0 || args[0] is "--help" or "-h")
         {
             Console.WriteLine(Help);
@@ -83,7 +87,7 @@ internal static class Program
                     throw new ArgumentException("Specify exactly one of --out <capture.ndjson> or --output-dir <folder>.");
                 }
 
-                liveOutput ??= Path.Combine(liveDirectory!, $"REDox-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.ndjson");
+                liveOutput ??= Path.Combine(liveDirectory!, $"REDox-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.ndjson.gz");
                 await LiveCapture.ReceiveAsync(liveOutput, writeSummary, cancellation.Token).ConfigureAwait(false);
                 return 0;
             }
@@ -123,7 +127,7 @@ internal static class Program
                 return 0;
             }
 
-            if (command is not ("ingest-log" or "ingest-insights" or "report" or "summarize"))
+            if (command is not ("compress" or "ingest-log" or "ingest-insights" or "report" or "summarize"))
             {
                 throw new ArgumentException($"Unknown command: {command}. Use --help.");
             }
@@ -170,7 +174,13 @@ internal static class Program
 
             options.TryGetValue("--thread", out var thread);
 
-            var outputPath = options.TryGetValue("--out", out var output) ? Path.GetFullPath(output) : null;
+            var outputPath = options.TryGetValue("--out", out var output) ? Path.GetFullPath(output) : command == "compress" ? inputs[0] + ".gz" : null;
+
+            if (command == "compress")
+            {
+                await DiagnosticFiles.CompressAsync(inputs[0], outputPath!, cancellation.Token).ConfigureAwait(false);
+                return 0;
+            }
 
             if (outputPath != null && File.Exists(outputPath))
             {
@@ -182,7 +192,7 @@ internal static class Program
                 temporaryPath = outputPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
             }
 
-            var writer = temporaryPath == null ? Console.Out : new StreamWriter(new FileStream(temporaryPath, FileMode.CreateNew), new UTF8Encoding(false));
+            var writer = temporaryPath == null ? Console.Out : new StreamWriter(DiagnosticFiles.Create(temporaryPath, outputPath!), new UTF8Encoding(false));
             try
             {
                 if (command == "summarize")
@@ -204,15 +214,30 @@ internal static class Program
                 }
                 else
                 {
-                    await using var stream = File.OpenRead(inputs[0]);
+                    await using var stream = DiagnosticFiles.OpenRead(inputs[0]);
                     using var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, true);
                     var events = command == "ingest-log"
                         ? LogImporter.ReadAsync(reader, inputs[0], cancellation.Token)
                         : InsightsImporter.ReadAsync(stream, inputs[0], options.ContainsKey("--tsv") ? '\t' : ',',
                             cancellation.Token);
+                    var logSummary = command == "ingest-log" ? new LlmSummary() : null;
                     await foreach (var item in events.ConfigureAwait(false))
                     {
+                        logSummary?.Add(item);
                         await writer.WriteLineAsync(JsonSerializer.Serialize(item, CaptureReader.WriteSettings)).ConfigureAwait(false);
+                    }
+                    if (logSummary is not null)
+                    {
+                        var embedded = new DiagnosticEvent
+                        {
+                            Source = "Log", Kind = "CaptureSummary", SourceFile = inputs[0], Completed = true,
+                            Message = logSummary.Render(),
+                            Attributes = new Dictionary<string, string>
+                            {
+                                ["SummaryFormat"] = "markdown", ["SummaryVersion"] = LlmSummary.SummaryVersion
+                            }
+                        };
+                        await writer.WriteLineAsync(JsonSerializer.Serialize(embedded, CaptureReader.WriteSettings)).ConfigureAwait(false);
                     }
                 }
 

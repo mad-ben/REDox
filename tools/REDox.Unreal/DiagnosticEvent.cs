@@ -141,12 +141,12 @@ public sealed class DiagnosticEvent
                 $"Unsupported schema {SchemaVersion}; re-export the trace with the current REDox.Unreal and Insights.");
         }
 
-        if (!((Source == "Log" && Kind is "Log" or "UnparsedLog")
+        if (!((Source == "Log" && Kind is "Log" or "UnparsedLog" or "CaptureSummary")
             || (Source == "Trace" && Kind is "Session" or "SessionEnd" or "CaptureSummary" or "TimelineCoverage"
                 or "TimerDef" or "ScopeBatch" or "GpuScopeBatch" or "TimingScope" or "GpuScope" or "Frame"
                 or "TraceLog" or "Bookmark" or "CounterBatch" or "Counter" or "GpuWaitFence" or "GpuSignalFence"
                 or "Task" or "RdgGraph" or "RdgPass" or "RdgScope" or "RdgTexture" or "RdgBuffer"
-                or "FrameStats" or "TimerStat" or "GpuQueueStat" or "Hitch" or "FrameTree" or "PsoStat" or "PsoEvent" or "LongScope")))
+                or "FrameStats" or "TimerStat" or "GpuQueueStat" or "Hitch" or "FrameTree" or "PsoStat" or "PsoEvent" or "LongScope" or "GpuSpike" or "GpuOverlap")))
         {
             throw new InvalidDataException($"Unsupported diagnostic record: {Source}/{Kind}.");
         }
@@ -164,7 +164,7 @@ public sealed class DiagnosticEvent
         }
 
         if (Source != "Trace" || Kind is "Session" or "SessionEnd" or "CaptureSummary" or "TimelineCoverage"
-            or "TimerDef" or "FrameStats" or "TimerStat" or "GpuQueueStat" or "PsoStat")
+            or "TimerDef" or "FrameStats" or "TimerStat" or "GpuQueueStat" or "PsoStat" or "GpuOverlap")
         {
             return;
         }
@@ -223,7 +223,10 @@ public sealed class DiagnosticEvent
             // Frame trees are relative to the frame start and may include parents that began earlier.
             if (Durations[index] < 0 || Depths[index] < 0 || (Kind != "FrameTree" && Starts[index] < 0))
             {
-                throw new InvalidDataException("Invalid scope batch entry.");
+                var details = FormattableString.Invariant(
+                    $"record {SourceRecord}, index {index}, start {Starts[index]}, duration {Durations[index]}, depth {Depths[index]}");
+                throw new InvalidDataException(
+                    $"Invalid scope batch entry ({Kind}, thread {ThreadId ?? "-"}, queue {QueueId ?? "-"}): {details}.");
             }
         }
 

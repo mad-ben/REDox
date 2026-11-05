@@ -15,12 +15,20 @@ namespace REDox.Unreal;
 // Renders the Summary records of a capture as compact Markdown for an LLM. Raw scopes are not read.
 public sealed partial class LlmSummary
 {
+    public const string SummaryVersion = "2";
+
     private static readonly string[] CpuGroups = ["GameThread", "RenderThread", "RHI", "Workers"];
     private const int TreeLinesPerThread = 40;
     private const int WorkerLines = 8;
     private const int LongScopeRows = 15;
     private const int PhaseTableRows = 15;
     private const int PsoGroups = 25;
+    private const int DetailedPhaseLimit = 4;
+    private const int ManyPhasesCpuRows = 10;
+    private const int ManyPhasesGpuRows = 8;
+    private const int BookmarkLines = 60;
+    private const double HitchBookmarkLead = 0.05;
+    private const string DefaultWaits = "Game thread idle time;STAT_FCurlMultiPollIOManager_Poll*;STAT_EventLoop_TEventLoop_Run*";
     // Hitches ranked up to FullHitches get worker lines and trees; lower ones get a table when they cost at least
     // SectionExcessUs above their local median, otherwise only their row in the hitch index.
     private const int FullHitches = 3;
@@ -40,6 +48,10 @@ public sealed partial class LlmSummary
     private readonly Dictionary<string, long> psoLogs = [];
     private readonly Dictionary<(string?, string?, string), (long Count, string First, string? Example)> logs = [];
     private readonly List<DiagnosticEvent> bookmarks = [];
+    private readonly List<DiagnosticEvent> gpuSpikes = [];
+    private readonly List<DiagnosticEvent> gpuOverlaps = [];
+    private HashSet<long> detailedPhases = [];
+    private Regex? waitPattern;
     private readonly Dictionary<string, CounterRange> counters = [];
     private readonly Dictionary<string, long> graphNames = [];
     private DiagnosticEvent? session;
@@ -88,6 +100,12 @@ public sealed partial class LlmSummary
                 break;
             case "Hitch":
                 hitches.Add(item);
+                break;
+            case "GpuSpike":
+                gpuSpikes.Add(item);
+                break;
+            case "GpuOverlap":
+                gpuOverlaps.Add(item);
                 break;
             case "FrameTree":
                 List(frameTrees, item.FrameIndex!.Value).Add(item);
@@ -154,17 +172,31 @@ public sealed partial class LlmSummary
     public static async Task<string> BuildAsync(string input, CancellationToken cancellationToken)
     {
         var summary = new LlmSummary();
+        string? embedded = null;
         await foreach (var item in CaptureReader.ReadAsync(input, false, cancellationToken).ConfigureAwait(false))
         {
+            if (item.Kind == "CaptureSummary" && item.Attributes?.GetValueOrDefault("SummaryFormat") == "markdown"
+                && item.Attributes.GetValueOrDefault("SummaryVersion") == SummaryVersion && item.Message is { } markdown)
+            {
+                embedded = markdown;
+            }
             summary.Add(item);
         }
 
-        return summary.Render();
+        return embedded ?? summary.Render();
     }
 
     // Waits and sleeps (Reflex, frame-rate limits) are symptoms; they are listed apart from the work that explains a slow frame.
-    public static bool IsWait(string? name) => name is not null
-        && (name.Contains("Wait", StringComparison.OrdinalIgnoreCase) || name.Contains("Sleep", StringComparison.OrdinalIgnoreCase));
+    // The export's wait list (Session attribute Waits) adds idle timers whose names do not say so.
+    public bool IsWait(string? name) => name is not null
+        && (name.Contains("Wait", StringComparison.OrdinalIgnoreCase) || name.Contains("Sleep", StringComparison.OrdinalIgnoreCase)
+            || WaitPattern().IsMatch(name));
+
+    private Regex WaitPattern() => waitPattern ??= new Regex(
+        "^(?:" + string.Join("|", (session?.Attributes?.GetValueOrDefault("Waits") ?? DefaultWaits)
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(pattern => Regex.Escape(pattern).Replace("\\*", ".*", StringComparison.Ordinal).Replace("\\?", ".", StringComparison.Ordinal))
+            .DefaultIfEmpty("(?!)")) + ")$", RegexOptions.CultureInvariant | RegexOptions.Singleline);
 
     public string Render()
     {
@@ -179,22 +211,27 @@ public sealed partial class LlmSummary
         RenderFrames(text);
         RenderHitchIndex(text);
         RenderLongScopes(text);
-        foreach (var phase in phaseQueues.Select(queue => Metric(queue, "Phase"))
-            .Concat(phaseTimers.Keys.Select(key => key.Phase)).Distinct().Order())
+        var phases = phaseQueues.Select(queue => Metric(queue, "Phase"))
+            .Concat(phaseTimers.Keys.Select(key => key.Phase)).Distinct().Order().ToList();
+        detailedPhases = [.. phases];
+        foreach (var phase in phases)
         {
             RenderPhase(text, phase);
         }
 
         RenderFrameReports(text);
+        RenderSpikesOutsideDetailedPhases(text);
         RenderPso(text);
         RenderContext(text);
         text.AppendLine("## Reading notes");
-        text.AppendLine("- Times are milliseconds. A phase is a stable stretch of frames between stalls of 100 ms or more (loads, mode switches); startup, transition and shutdown frames are outside phases.");
+        text.AppendLine("- Times are milliseconds. A phase (segment) is a stable stretch of frames between stalls of 100 ms or more and the CVar, LoadMap and LoadingScreen bookmarks (loads, mode switches); startup, transition and shutdown frames are outside phases. Only the largest phases have tables.");
         text.AppendLine("- Hitches are runs of frames over their local threshold (1.5x the median of the surrounding frames, at least +4 ms), ranked by time above that median. Consecutive slow frames are one hitch.");
         text.AppendLine("- Phase CPU values are per game frame: average and maximum of the timer's total within a frame. Exclusive (excl) is self time; inclusive (incl) contains children. Do not add nested or parallel values.");
         text.AppendLine("- RenderThread, RHI and Workers sum every thread in the group. Hitch tables compare totals over the hitch with the phase average times the number of frames (extra excl).");
         text.AppendLine("- GPU values are busy time: scope time overlapping the queue's GpuWork intervals, so idle gaps inside breadcrumbs are not counted. GPU work is pipelined; a frame's GPU numbers are the work overlapping that game frame.");
-        text.AppendLine("- Waits are listed separately from work. A long wait points at the thread or GPU queue it waits for, not at itself.");
+        text.AppendLine("- Waits are listed separately from work. A long wait points at the thread or GPU queue it waits for, not at itself. Timers named Wait or Sleep and the export's wait-timer list (Waits setting) are idle, not work.");
+        text.AppendLine("- GPU spikes are single scope instances over 2.5x their phase median and at least 1 ms above it, with the game frame they started in; nested wrappers of the same spike are merged.");
+        text.AppendLine("- Async compute overlap: per GPU frame, how much of the graphics frame the async queue was idle (head = before its first work, tail = after its last), how many async frames ran into the next frame's graphics work, and per async pass how much of its time overlapped graphics-queue work.");
         text.AppendLine("- PSO \"Missed\" means the pipeline was not precached and was compiled when first needed; the requesting render work waits for it.");
         text.AppendLine("- Excluded timers are dropped from tables and trees, but their time still counts in their parents.");
         text.AppendLine("- Drill into any frame with: `REDox.Unreal.exe report <capture.ndjson> --frame <index> --limit 200`.");
@@ -244,19 +281,66 @@ public sealed partial class LlmSummary
 
         text.AppendLine("## Frames");
         text.AppendLine(CultureInfo.InvariantCulture,
-            $"{Metric(all, "Frames")} game frames from {all.StartTimeSeconds:0.00} s (engine init before that appears only under long scopes) in {Metric(all, "Phases")} phases. Outside phases: startup {Metric(all, "StartupFrames")} frames ({Ms(all, "StartupUs")} ms), transitions {Metric(all, "TransitionFrames")} frames ({Ms(all, "TransitionUs")} ms), shutdown {Metric(all, "ShutdownFrames")} frames.");
-        text.AppendLine("| Phase | Time (s) | Frames | Mean | P50 | P95 | P99 | Max (frame) | Rendering P50 / P95 | Hitch threshold | Over threshold |");
-        text.AppendLine("|---|---|---|---|---|---|---|---|---|---|---|");
-        foreach (var item in frameStats.Where(item => item.FrameType == "Game").OrderBy(item => Metric(item, "Phase")))
+            $"{Metric(all, "Frames")} game frames from {all.StartTimeSeconds:0.00} s (engine init before that appears only under long scopes) in {Metric(all, "Phases")} segments (phases split at stalls of 100 ms or more and at CVar, LoadMap and LoadingScreen bookmarks). Outside phases: startup {Metric(all, "StartupFrames")} frames ({Ms(all, "StartupUs")} ms), transitions {Metric(all, "TransitionFrames")} frames ({Ms(all, "TransitionUs")} ms), shutdown {Metric(all, "ShutdownFrames")} frames.");
+        text.AppendLine("| Phase | Time (s) | Segment | Frames | Mean | P50 | P95 | P99 | Max (frame) | Rendering P50 / P95 | GPU busy P50 | Hitch threshold | Over threshold |");
+        text.AppendLine("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        var game = frameStats.Where(item => item.FrameType == "Game").OrderBy(item => Metric(item, "Phase")).ToList();
+        foreach (var item in game)
         {
             var phase = Metric(item, "Phase");
             var rendering = frameStats.FirstOrDefault(other => other.FrameType == "Rendering" && Metric(other, "Phase") == phase && Has(other, "Phase") == Has(item, "Phase"));
             text.AppendLine(FormattableString.Invariant(
-                $"| {(phase == 0 ? "all" : phase.ToString(CultureInfo.InvariantCulture))} | {item.StartTimeSeconds:0.00}-{item.EndTimeSeconds:0.00} | {Metric(item, "Frames")} | {Ms(item, "MeanUs")} | {Ms(item, "P50Us")} | {Ms(item, "P95Us")} | {Ms(item, "P99Us")} | {Ms(item, "MaxUs")} ({item.FrameIndex}) | {(rendering is null ? "-" : $"{Ms(rendering, "P50Us")} / {Ms(rendering, "P95Us")}")} | {(phase == 0 ? "-" : Ms(item, "HitchThresholdUs"))} | {(phase == 0 ? "-" : Metric(item, "HitchFrames").ToString(CultureInfo.InvariantCulture))} |"));
+                $"| {(phase == 0 ? "all" : phase.ToString(CultureInfo.InvariantCulture))} | {item.StartTimeSeconds:0.00}-{item.EndTimeSeconds:0.00} | {(phase == 0 ? "-" : Cell(Segment(item)) is { Length: > 0 } segment ? segment : "-")} | {Metric(item, "Frames")} | {Ms(item, "MeanUs")} | {Ms(item, "P50Us")} | {Ms(item, "P95Us")} | {Ms(item, "P99Us")} | {Ms(item, "MaxUs")} ({item.FrameIndex}) | {(rendering is null ? "-" : $"{Ms(rendering, "P50Us")} / {Ms(rendering, "P95Us")}")} | {(phase == 0 ? "-" : GpuP50(phase))} | {(phase == 0 ? "-" : Ms(item, "HitchThresholdUs"))} | {(phase == 0 ? "-" : Metric(item, "HitchFrames").ToString(CultureInfo.InvariantCulture))} |"));
         }
 
         text.AppendLine();
+        var withCVars = game.Where(item => Metric(item, "Phase") > 0 && Attr(item, "CVars") is { Length: > 0 }).ToList();
+        if (withCVars.Count > 0)
+        {
+            text.AppendLine("Active CVars per phase (set by dev-menu bookmarks; others keep their startup values):");
+            foreach (var item in withCVars)
+            {
+                text.AppendLine(CultureInfo.InvariantCulture, $"- Phase {Metric(item, "Phase")}: {OneLine(Attr(item, "CVars"))}");
+            }
+
+            text.AppendLine();
+        }
     }
+
+    // Map, loading screen and the CVar change that opened the phase.
+    private static string Segment(DiagnosticEvent stats)
+    {
+        var parts = new List<string>();
+        if (Attr(stats, "Map") is { Length: > 0 } map)
+        {
+            parts.Add(map);
+        }
+
+        if (Attr(stats, "LoadingScreen") == "1")
+        {
+            parts.Add("loading screen");
+        }
+
+        if (Attr(stats, "Changed") is { Length: > 0 } changed)
+        {
+            parts.Add(changed);
+        }
+
+        return string.Join("; ", parts);
+    }
+
+    // Detailed phases only: P50 busy time of each queue, named by the part after the adapter prefix.
+    private string GpuP50(long phase)
+    {
+        var queues = phaseQueues.Where(queue => Metric(queue, "Phase") == phase && Has(queue, "P50BusyUs")).ToList();
+        return queues.Count == 0
+            ? "-"
+            : string.Join(", ", queues.Select(queue => $"{QueueName(queue)} {Ms(queue, "P50BusyUs")}"));
+    }
+
+    private static string QueueName(DiagnosticEvent queue) => queue.Category is { } name && name.IndexOf('-', StringComparison.Ordinal) is var dash and >= 0 ? name[(dash + 1)..] : queue.Category ?? "?";
+
+    private static string Attr(DiagnosticEvent item, string name) => item.Attributes?.GetValueOrDefault(name) ?? "";
 
     private void RenderHitchIndex(StringBuilder text)
     {
@@ -273,14 +357,49 @@ public sealed partial class LlmSummary
         text.AppendLine("|---|---|---|---|---|---|---|---|");
         foreach (var hitch in ranked)
         {
-            var top = WorkRows(hitch).Where(entry => !entry.LongTask).Take(2)
+            var load = MapLoad(hitch);
+            var top = load is not null ? [] : WorkRows(hitch).Where(entry => !entry.LongTask).Take(2)
                 .Select(entry => FormattableString.Invariant($"{entry.Row.Category} {Cell(Describe(entry.Row, hitch))} {Format(entry.Extra / 1000.0)}")).ToList();
+            var extra = load is not null ? $"map load: {Cell(load)}"
+                : top.Count == 0 ? "-"
+                : (CVarChange(hitch) is { } change ? $"after {Cell(change)}; " : "") + string.Join("; ", top);
             var misses = PsoEventsIn(hitch);
             text.AppendLine(FormattableString.Invariant(
-                $"| {Metric(hitch, "Rank")} | {hitch.StartTimeSeconds:0.000} | {FrameRange(hitch)} | {Ms(hitch, "DurationUs")} | {Ms(hitch, "MedianUs")} | {Metric(hitch, "Phase")} | {(top.Count == 0 ? "-" : string.Join("; ", top))} | {(misses.Count == 0 ? "-" : $"{misses.Count} ({Format(misses.Sum(item => Metric(item, "DurationUs")) / 1000.0)} ms)")} |"));
+                $"| {Metric(hitch, "Rank")} | {hitch.StartTimeSeconds:0.000} | {FrameRange(hitch)} | {Ms(hitch, "DurationUs")} | {Ms(hitch, "MedianUs")} | {(load is not null ? "load" : PhaseLabel(hitch))} | {extra} | {(misses.Count == 0 ? "-" : $"{misses.Count} ({Format(misses.Sum(item => Metric(item, "DurationUs")) / 1000.0)} ms)")} |"));
         }
 
         text.AppendLine();
+    }
+
+    private IEnumerable<DiagnosticEvent> BookmarksAt(DiagnosticEvent hitch) => bookmarks.Where(bookmark =>
+        bookmark.StartTimeSeconds >= (hitch.StartTimeSeconds ?? 0) - HitchBookmarkLead && bookmark.StartTimeSeconds <= (hitch.EndTimeSeconds ?? 0));
+
+    // The first map load or loading screen start touching the hitch, or null.
+    private string? MapLoad(DiagnosticEvent hitch) => hitch.Category != "Hitch" ? null : BookmarksAt(hitch)
+        .FirstOrDefault(bookmark => bookmark.Message?.StartsWith("LoadMap", StringComparison.Ordinal) == true
+            || bookmark.Message?.StartsWith("LoadingScreen/Show", StringComparison.Ordinal) == true)?.Message;
+
+    // The first CVar change (as CVar name=value) or other loading screen bookmark touching the hitch, or null.
+    private string? CVarChange(DiagnosticEvent hitch) => hitch.Category != "Hitch" ? null : BookmarksAt(hitch)
+        .Where(bookmark => bookmark.Message?.StartsWith("CVar ", StringComparison.Ordinal) == true
+            || bookmark.Message?.StartsWith("LoadingScreen/", StringComparison.Ordinal) == true)
+        .Select(bookmark => bookmark.Message!.Replace(" = ", "=", StringComparison.Ordinal)).FirstOrDefault();
+
+    // The phase number, or the phases around a hitch that lies between phases.
+    private string PhaseLabel(DiagnosticEvent hitch)
+    {
+        var ranges = frameStats.Where(item => item.FrameType == "Game" && Metric(item, "Phase") > 0).OrderBy(item => Metric(item, "Phase")).ToList();
+        var start = hitch.StartTimeSeconds ?? 0;
+        if (ranges.Count == 0 || hitch.Category != "Hitch" || ranges.Any(item => start >= item.StartTimeSeconds && start <= item.EndTimeSeconds))
+        {
+            return Metric(hitch, "Phase").ToString(CultureInfo.InvariantCulture);
+        }
+
+        var before = ranges.LastOrDefault(item => item.EndTimeSeconds < start);
+        var after = ranges.FirstOrDefault(item => item.StartTimeSeconds > start);
+        return before is null ? $"before {Metric(after!, "Phase")}"
+            : after is null ? $"after {Metric(before, "Phase")}"
+            : $"between {Metric(before, "Phase")} and {Metric(after, "Phase")}";
     }
 
     private void RenderLongScopes(StringBuilder text)
@@ -308,13 +427,16 @@ public sealed partial class LlmSummary
     private void RenderPhase(StringBuilder text, long phase)
     {
         var stats = frameStats.FirstOrDefault(item => item.FrameType == "Game" && Has(item, "Phase") && Metric(item, "Phase") == phase);
+        var many = detailedPhases.Count > DetailedPhaseLimit;
+        var segment = stats is null ? "" : Segment(stats);
         text.AppendLine(stats is null
             ? FormattableString.Invariant($"## Phase {phase}")
-            : FormattableString.Invariant($"## Phase {phase}: {stats.StartTimeSeconds:0.00}-{stats.EndTimeSeconds:0.00} s, {Metric(stats, "Frames")} frames, P50 {Ms(stats, "P50Us")} ms"));
+            : FormattableString.Invariant($"## Phase {phase}: {stats.StartTimeSeconds:0.00}-{stats.EndTimeSeconds:0.00} s, {Metric(stats, "Frames")} frames, P50 {Ms(stats, "P50Us")} ms{(segment.Length > 0 ? $" — {segment}" : "")}"));
         text.AppendLine("### CPU per game frame");
         foreach (var group in CpuGroups)
         {
-            var rows = TopRows(phaseTimers.Where(pair => pair.Key.Phase == phase && pair.Key.Category == group && pair.Value.QueueId is null).Select(pair => pair.Value));
+            var rows = TopRows(phaseTimers.Where(pair => pair.Key.Phase == phase && pair.Key.Category == group && pair.Value.QueueId is null
+                && !(group == "Workers" && IsWait(pair.Value.Name))).Select(pair => pair.Value), many ? ManyPhasesCpuRows : PhaseTableRows);
             if (rows.Count == 0)
             {
                 continue;
@@ -351,7 +473,8 @@ public sealed partial class LlmSummary
         text.AppendLine();
         foreach (var queue in queues)
         {
-            var rows = TopRows(phaseTimers.Where(pair => pair.Key.Phase == phase && pair.Value.QueueId == queue.QueueId).Select(pair => pair.Value));
+            var rows = TopRows(phaseTimers.Where(pair => pair.Key.Phase == phase && pair.Value.QueueId == queue.QueueId).Select(pair => pair.Value),
+                many ? ManyPhasesGpuRows : PhaseTableRows);
             if (rows.Count == 0)
             {
                 continue;
@@ -368,14 +491,75 @@ public sealed partial class LlmSummary
 
             text.AppendLine();
         }
+
+        var spikes = gpuSpikes.Where(spike => Metric(spike, "Phase") == phase).ToList();
+        if (spikes.Count > 0)
+        {
+            text.AppendLine("### GPU spikes (single scopes over 2.5x their phase median and at least 1 ms above it)");
+            RenderSpikes(text, spikes, false);
+        }
+
+        foreach (var queue in queues.Where(queue => Metric(queue, "GpuFrames") > 0))
+        {
+            var passes = gpuOverlaps.Where(item => Metric(item, "Phase") == phase && item.QueueId == queue.QueueId).OrderByDescending(item => Metric(item, "BusyUs")).ToList();
+            text.AppendLine(CultureInfo.InvariantCulture, $"### Async compute overlap ({queue.Category})");
+            text.AppendLine(CultureInfo.InvariantCulture,
+                $"Per GPU frame: graphics frame {Ms(queue, "AvgGraphicsFrameUs")} ms, async idle {Ms(queue, "AvgIdleUs")} ms (head {Ms(queue, "AvgHeadIdleUs")}, tail {Ms(queue, "AvgTailIdleUs")}); async work of {Metric(queue, "CrossingFrames")} of {Metric(queue, "GpuFrames")} frames ran into the next frame's graphics work ({Ms(queue, "AvgCrossUs")} ms avg).");
+            if (passes.Count > 0)
+            {
+                text.AppendLine("| Async pass | Busy/frame | Overlaps graphics | Main graphics overlap | Into next frame |");
+                text.AppendLine("|---|---|---|---|---|");
+                foreach (var pass in passes)
+                {
+                    var busy = Math.Max(1, Metric(pass, "BusyUs"));
+                    var main = string.Join(", ", Enumerable.Range(0, 3).Where(i => Attr(pass, $"Graphics{i}").Length > 0)
+                        .Select(i => FormattableString.Invariant($"{Attr(pass, $"Graphics{i}")} ({100.0 * Metric(pass, $"Graphics{i}Us") / busy:0}%)")));
+                    var frames = Math.Max(1, Metric(pass, "Frames"));
+                    text.AppendLine(FormattableString.Invariant(
+                        $"| {Cell(pass.Name)} | {Format(Metric(pass, "BusyUs") / 1000.0 / frames)} | {100.0 * Metric(pass, "GraphicsOverlapUs") / busy:0}% | {(main.Length == 0 ? "-" : Cell(main))} | {(Metric(pass, "NextFrameUs") == 0 && Metric(pass, "CrossingCalls") == 0 ? "-" : $"{Format(Metric(pass, "NextFrameUs") / 1000.0 / frames)} ms ({Metric(pass, "CrossingCalls")} calls)")} |"));
+                }
+            }
+
+            text.AppendLine();
+        }
+    }
+
+    private void RenderSpikes(StringBuilder text, List<DiagnosticEvent> spikes, bool withPhase)
+    {
+        text.AppendLine(withPhase
+            ? "| Phase | t (s) | Frame | Queue | Scope | Busy | Phase median | x median |"
+            : "| t (s) | Frame | Queue | Scope | Busy | Phase median | x median |");
+        text.AppendLine(withPhase ? "|---|---|---|---|---|---|---|---|" : "|---|---|---|---|---|---|---|");
+        foreach (var spike in spikes.OrderBy(spike => Metric(spike, "Phase")).ThenByDescending(spike => Metric(spike, "DurationUs") - Metric(spike, "MedianUs")))
+        {
+            var phase = Metric(spike, "Phase");
+            var start = frameStats.FirstOrDefault(item => item.FrameType == "Game" && Has(item, "Phase") && Metric(item, "Phase") == phase)?.StartTimeSeconds;
+            var shown = spikes.Count(other => other.Name == spike.Name && Metric(other, "Phase") == phase);
+            var time = FormattableString.Invariant($"{spike.StartTimeSeconds:0.000}{(spike.StartTimeSeconds < start ? " (before phase)" : "")}");
+            var name = Cell(spike.Name) + (Metric(spike, "NameSpikes") > shown ? FormattableString.Invariant($" ({Metric(spike, "NameSpikes")} spikes)") : "");
+            text.AppendLine(FormattableString.Invariant(
+                $"| {(withPhase ? $"{phase} | " : "")}{time} | {spike.FrameIndex} | {spike.Category} | {name} | {Ms(spike, "DurationUs")} | {Ms(spike, "MedianUs")} | {(double)Metric(spike, "DurationUs") / Math.Max(1, Metric(spike, "MedianUs")):0.0}x |"));
+        }
+
+        text.AppendLine();
+    }
+
+    private void RenderSpikesOutsideDetailedPhases(StringBuilder text)
+    {
+        var spikes = gpuSpikes.Where(spike => !detailedPhases.Contains(Metric(spike, "Phase"))).ToList();
+        if (spikes.Count > 0)
+        {
+            text.AppendLine("## GPU spikes outside detailed phases");
+            RenderSpikes(text, spikes, true);
+        }
     }
 
     // The most expensive subtrees plus the largest self times, without near-zero rows.
-    private static List<DiagnosticEvent> TopRows(IEnumerable<DiagnosticEvent> source)
+    private static List<DiagnosticEvent> TopRows(IEnumerable<DiagnosticEvent> source, int limit)
     {
         var rows = source.Where(IsSignificant).ToList();
         var exclusive = rows.OrderByDescending(row => Metric(row, "AvgExclUs")).Take(5);
-        return rows.OrderByDescending(row => Metric(row, "AvgInclUs")).Take(PhaseTableRows).Union(exclusive)
+        return rows.OrderByDescending(row => Metric(row, "AvgInclUs")).Take(limit).Union(exclusive)
             .OrderByDescending(row => Metric(row, "AvgInclUs")).ToList();
     }
 
@@ -396,12 +580,19 @@ public sealed partial class LlmSummary
                 continue;
             }
 
+            var load = MapLoad(hitch);
+            var change = CVarChange(hitch);
+            var suffix = load is not null ? $" — map load ({load})" : change is not null ? $" — {change}" : "";
             text.AppendLine(hitch.Category switch
             {
                 "Typical" => FormattableString.Invariant($"## Typical frame of phase {phase}: game frame {frame}, {Format(duration)} ms (phase median {Ms(hitch, "MedianUs")} ms), t = {hitch.StartTimeSeconds:0.000} s"),
                 "Startup" => FormattableString.Invariant($"## Startup: game {FrameRange(hitch)}, {Format(duration)} ms, t = {hitch.StartTimeSeconds:0.000} s (compared with phase {phase})"),
-                _ => FormattableString.Invariant($"## Hitch {Metric(hitch, "Rank")}: game {FrameRange(hitch)}, {Format(duration)} ms, t = {hitch.StartTimeSeconds:0.000} s; phase {phase}, local median {Ms(hitch, "MedianUs")} ms")
+                _ => FormattableString.Invariant($"## Hitch {Metric(hitch, "Rank")}: game {FrameRange(hitch)}, {Format(duration)} ms, t = {hitch.StartTimeSeconds:0.000} s; phase {PhaseLabel(hitch)}, local median {Ms(hitch, "MedianUs")} ms{suffix}")
             });
+            if (load is not null)
+            {
+                text.AppendLine("This span contains a map load; its work is loading, not a steady-state regression.");
+            }
 
             if (frameQueues.TryGetValue(frame, out var queues))
             {
@@ -416,7 +607,7 @@ public sealed partial class LlmSummary
             if (frameTimers.TryGetValue(frame, out var rows))
             {
                 RenderFrameTable(text, hitch, rows, typical ? 10 : detailed ? 15 : 8);
-                if (detailed || typical)
+                if ((detailed || typical) && load is null)
                 {
                     RenderWorkers(text, rows.Where(row => row.Category == "WorkerThread").ToList());
                 }
@@ -513,7 +704,7 @@ public sealed partial class LlmSummary
     }
 
     // Threads of one pool (numbered workers, PSO precompile threads) share a line; per-thread imbalance stays visible.
-    private static void RenderWorkers(StringBuilder text, List<DiagnosticEvent> rows)
+    private void RenderWorkers(StringBuilder text, List<DiagnosticEvent> rows)
     {
         var pools = rows.Where(row => !IsWait(row.Name)).GroupBy(row => PoolNumber().Replace(row.ThreadName ?? row.ThreadId ?? "?", ""))
             .Select(pool => (Name: pool.Key, Threads: pool.Select(row => row.ThreadName ?? row.ThreadId).Distinct().Count(),
@@ -719,14 +910,35 @@ public sealed partial class LlmSummary
         if (bookmarks.Count > 0)
         {
             text.AppendLine("## Bookmarks");
-            foreach (var bookmark in bookmarks.Take(30))
+            var lines = new List<(double Time, string Line)>();
+            var groups = new Dictionary<string, (double First, string Text, long Count, double Last)>();
+            foreach (var bookmark in bookmarks)
             {
-                text.AppendLine(CultureInfo.InvariantCulture, $"- {bookmark.StartTimeSeconds:0.000} s: {OneLine(bookmark.Message)}");
+                var message = OneLine(bookmark.Message);
+                var time = bookmark.StartTimeSeconds ?? 0;
+                if (message.StartsWith("CVar ", StringComparison.Ordinal) || message.StartsWith("LoadMap", StringComparison.Ordinal)
+                    || message.StartsWith("LoadingScreen/", StringComparison.Ordinal) || message.StartsWith("Engine exit", StringComparison.Ordinal)
+                    || message.StartsWith("Tick loop", StringComparison.Ordinal))
+                {
+                    lines.Add((time, FormattableString.Invariant($"- {time:0.000} s: {message}")));
+                    continue;
+                }
+
+                var key = Digits().Replace(message, "#");
+                groups[key] = groups.TryGetValue(key, out var group) ? (group.First, group.Text, group.Count + 1, time) : (time, message, 1, time);
             }
 
-            if (bookmarks.Count > 30)
+            lines.AddRange(groups.Values.Select(group => (group.First, FormattableString.Invariant(
+                $"- {group.First:0.000} s: {group.Text}{(group.Count > 1 ? $" x{group.Count} (until {group.Last:0.00} s)" : "")}"))));
+            lines = [.. lines.OrderBy(line => line.Time)];
+            foreach (var (_, line) in lines.Take(BookmarkLines))
             {
-                text.AppendLine(CultureInfo.InvariantCulture, $"- ... {bookmarks.Count - 30} more");
+                text.AppendLine(line);
+            }
+
+            if (lines.Count > BookmarkLines)
+            {
+                text.AppendLine(CultureInfo.InvariantCulture, $"- ... {lines.Count - BookmarkLines} more");
             }
 
             text.AppendLine();
